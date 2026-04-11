@@ -6,8 +6,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
@@ -20,6 +23,7 @@ from market_signal_tool import (
     EastMoneyClient,
     MarketDataError,
     MarketSnapshot,
+    SOURCE_HEALTH_TRACKER,
     SOURCE_METADATA,
     SignalEngine,
     http_get_json,
@@ -31,9 +35,46 @@ from market_signal_tool import (
 )
 
 
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "config.example.json")
-CUSTOM_STRATEGIES_PATH = os.path.join(BASE_DIR, "custom_strategies.json")
+def resolve_resource_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.abspath(getattr(sys, "_MEIPASS", os.path.dirname(sys.executable)))
+    return os.path.abspath(os.path.dirname(__file__))
+
+
+def resolve_app_data_dir() -> str:
+    override = os.getenv("SIGNAL_DECK_DATA_DIR", "").strip()
+    if override:
+        return os.path.abspath(override)
+    home_dir = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        return os.path.join(home_dir, "Library", "Application Support", "SignalDeck")
+    if os.name == "nt":
+        appdata = os.getenv("APPDATA", "").strip()
+        if appdata:
+            return os.path.join(appdata, "SignalDeck")
+        return os.path.join(home_dir, "AppData", "Roaming", "SignalDeck")
+    return os.path.join(home_dir, ".signal-deck")
+
+
+def ensure_runtime_file(target_path: str, default_path: str, fallback: str = "") -> None:
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    if os.path.exists(target_path):
+        return
+    if default_path and os.path.exists(default_path):
+        shutil.copyfile(default_path, target_path)
+        return
+    with open(target_path, "w", encoding="utf-8") as file:
+        file.write(fallback)
+
+
+RESOURCE_DIR = resolve_resource_dir()
+DATA_DIR = resolve_app_data_dir()
+CONFIG_TEMPLATE_PATH = os.path.join(RESOURCE_DIR, "config.example.json")
+CUSTOM_STRATEGIES_TEMPLATE_PATH = os.path.join(RESOURCE_DIR, "custom_strategies.json")
+CONFIG_PATH = os.path.join(DATA_DIR, "config.example.json")
+CUSTOM_STRATEGIES_PATH = os.path.join(DATA_DIR, "custom_strategies.json")
+ensure_runtime_file(CONFIG_PATH, CONFIG_TEMPLATE_PATH, "{}\n")
+ensure_runtime_file(CUSTOM_STRATEGIES_PATH, CUSTOM_STRATEGIES_TEMPLATE_PATH, '{"strategies":{},"deleted":[]}\n')
 SEARCH_TOKEN = "D43BF722C8E33BDC906FB84D85E326E8"
 SEARCH_BASE = "https://searchapi.eastmoney.com/api/suggest/get"
 CLIST_BASE = "https://push2.eastmoney.com/api/qt/clist/get"
@@ -48,6 +89,15 @@ SEARCH_UNIVERSE_LOCK = Lock()
 PREFIX_SEGMENT_CACHE: Dict[str, Any] = {}
 PREFIX_SEGMENT_LOCK = Lock()
 CUSTOM_STRATEGY_LOCK = Lock()
+RESPONSE_CACHE: Dict[str, Dict[str, Any]] = {}
+RESPONSE_CACHE_LOCK = Lock()
+RESPONSE_CACHE_MAX_ITEMS = 1024
+CHART_CACHE_TTL = 3.0
+SNAPSHOT_CACHE_TTL = 2.0
+STRATEGY_SIGNAL_CACHE_TTL = 3.0
+DASHBOARD_PULSE_CACHE_TTL = 2.0
+WATCHLIST_STREAK_CACHE_TTL = 20.0
+RESPONSE_CACHE_MISS = object()
 
 DEFAULT_SYMBOL = "sh000001"
 DEFAULT_TIMEFRAME = "1d"
@@ -105,9 +155,368 @@ STRATEGY_PRESETS = {
     },
 }
 
-app = Flask(__name__)
+app = Flask(
+    __name__,
+    template_folder=os.path.join(RESOURCE_DIR, "templates"),
+    static_folder=os.path.join(RESOURCE_DIR, "static"),
+)
 app.json.ensure_ascii = False
 client = EastMoneyClient()
+
+
+def build_response_cache_key(prefix: str, *parts: Any) -> str:
+    normalized_parts: List[str] = [prefix]
+    for part in parts:
+        if isinstance(part, (dict, list, tuple, set)):
+            normalized_parts.append(json.dumps(part, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        else:
+            normalized_parts.append(str(part))
+    return "|".join(normalized_parts)
+
+
+def get_response_cache(key: str) -> Any:
+    now = time.time()
+    with RESPONSE_CACHE_LOCK:
+        entry = RESPONSE_CACHE.get(key)
+        if not entry:
+            return RESPONSE_CACHE_MISS
+        if float(entry.get("expires_at") or 0.0) <= now:
+            RESPONSE_CACHE.pop(key, None)
+            return RESPONSE_CACHE_MISS
+        return copy.deepcopy(entry.get("value"))
+
+
+def set_response_cache(key: str, value: Any, ttl: float) -> Any:
+    now = time.time()
+    stored = copy.deepcopy(value)
+    with RESPONSE_CACHE_LOCK:
+        RESPONSE_CACHE[key] = {
+            "expires_at": now + max(ttl, 0.0),
+            "value": stored,
+            "updated_at": now,
+        }
+        if len(RESPONSE_CACHE) > RESPONSE_CACHE_MAX_ITEMS:
+            stale_keys = sorted(
+                RESPONSE_CACHE.keys(),
+                key=lambda item: float(RESPONSE_CACHE[item].get("expires_at") or 0.0),
+            )[: max(1, len(RESPONSE_CACHE) - RESPONSE_CACHE_MAX_ITEMS)]
+            for stale_key in stale_keys:
+                RESPONSE_CACHE.pop(stale_key, None)
+    return copy.deepcopy(stored)
+
+
+def get_or_set_response_cache(key: str, ttl: float, builder: Any) -> Any:
+    cached = get_response_cache(key)
+    if cached is not RESPONSE_CACHE_MISS:
+        return cached
+    value = builder()
+    return set_response_cache(key, value, ttl)
+
+
+def clear_response_cache(prefix: Optional[str] = None) -> None:
+    with RESPONSE_CACHE_LOCK:
+        if not prefix:
+            RESPONSE_CACHE.clear()
+            return
+        cache_prefix = f"{prefix}|"
+        keys = [key for key in RESPONSE_CACHE.keys() if key.startswith(cache_prefix)]
+        for key in keys:
+            RESPONSE_CACHE.pop(key, None)
+
+
+def fetch_bars_with_source_cached(
+    symbol: str,
+    timeframe: str,
+    max_bars: int,
+    adjust: str,
+    source: str,
+    ttl: float,
+) -> Tuple[str, List[Any], str]:
+    requested_source = normalize_source_name(source)
+    cache_key = build_response_cache_key("bars", symbol, timeframe, max_bars, adjust, requested_source)
+    return get_or_set_response_cache(
+        cache_key,
+        ttl,
+        lambda: client.fetch_bars_with_source(symbol, timeframe, max_bars, adjust, source=requested_source),
+    )
+
+
+def fetch_snapshot_cached(symbol: str, source: str, ttl: float = SNAPSHOT_CACHE_TTL) -> MarketSnapshot:
+    requested_source = normalize_source_name(source)
+    cache_key = build_response_cache_key("snapshot", symbol, requested_source)
+    return get_or_set_response_cache(
+        cache_key,
+        ttl,
+        lambda: client.fetch_snapshot(symbol, source=requested_source),
+    )
+
+
+def build_strategy_signal_payload_cached(symbol: str, strategy_name: str, source: str) -> Dict[str, Any]:
+    cache_key = build_response_cache_key("strategy", symbol, normalize_strategy_name(strategy_name), normalize_source_name(source))
+    return get_or_set_response_cache(
+        cache_key,
+        STRATEGY_SIGNAL_CACHE_TTL,
+        lambda: build_strategy_signal_payload(symbol, strategy_name, source),
+    )
+
+
+def build_chart_payload_cached(
+    symbol: str,
+    timeframe: str,
+    adjust: str,
+    history_bars: int,
+    source: str,
+) -> Dict[str, Any]:
+    cache_key = build_response_cache_key("chart", symbol, timeframe, adjust, history_bars, normalize_source_name(source))
+    return get_or_set_response_cache(
+        cache_key,
+        CHART_CACHE_TTL,
+        lambda: build_chart_payload(symbol, timeframe, adjust, history_bars, source),
+    )
+
+
+def compute_watchlist_streak_cached(symbol: str, source: str) -> Dict[str, Any]:
+    requested_source = normalize_source_name(source)
+    cache_key = build_response_cache_key("watchlist-streak", symbol, requested_source)
+    return get_or_set_response_cache(
+        cache_key,
+        WATCHLIST_STREAK_CACHE_TTL,
+        lambda: compute_consecutive_trend(
+            fetch_bars_with_source_cached(
+                symbol,
+                "1d",
+                6,
+                "none",
+                requested_source,
+                WATCHLIST_STREAK_CACHE_TTL,
+            )[1]
+        ),
+    )
+
+
+def normalize_symbol_request_list(raw_symbols: str, limit: int = 120) -> List[str]:
+    tokens = [item.strip() for item in str(raw_symbols or "").split(",") if item.strip()]
+    ordered_symbols: List[str] = []
+    seen: set[str] = set()
+    for token in tokens[:limit]:
+        normalized = token.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered_symbols.append(token)
+    return ordered_symbols
+
+
+def build_watchlist_quotes_payload(raw_symbols: str, source: str) -> Dict[str, Any]:
+    requested_source = normalize_source_name(source)
+    ordered_symbols = normalize_symbol_request_list(raw_symbols)
+    if not ordered_symbols:
+        return {"quotes": [], "errors": []}
+
+    def fetch_one(raw_symbol: str) -> Dict[str, Any]:
+        symbol = resolve_symbol(raw_symbol)
+        snapshot = fetch_snapshot_cached(symbol, requested_source, ttl=SNAPSHOT_CACHE_TTL)
+        try:
+            streak = compute_watchlist_streak_cached(symbol, requested_source)
+        except Exception:
+            streak = {"direction": "", "days": 0, "label": ""}
+        return {
+            "requested_symbol": raw_symbol.lower(),
+            "symbol": symbol,
+            "name": snapshot.name,
+            "source": build_source_info(requested_source, snapshot.source),
+            "market": serialize_snapshot(snapshot),
+            "streak": streak,
+        }
+
+    quotes: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+    max_workers = min(6, len(ordered_symbols)) or 1
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(fetch_one, symbol): symbol for symbol in ordered_symbols}
+        for future in as_completed(future_map):
+            raw_symbol = future_map[future]
+            try:
+                quotes.append(future.result())
+            except Exception as exc:  # noqa: BLE001
+                errors.append({"symbol": raw_symbol, "error": str(exc)})
+
+    order_index = {symbol.lower(): idx for idx, symbol in enumerate(ordered_symbols)}
+    quotes.sort(key=lambda item: order_index.get(item.get("requested_symbol", ""), len(order_index)))
+    for item in quotes:
+        item.pop("requested_symbol", None)
+    errors.sort(key=lambda item: order_index.get(item["symbol"].lower(), len(order_index)))
+    return {"quotes": quotes, "errors": errors}
+
+
+def build_watchlist_strategy_signals_payload(raw_symbols: str, strategy_name: str, source: str) -> Dict[str, Any]:
+    strategy_id = normalize_strategy_name(strategy_name)
+    if strategy_id == "none":
+        return {"signals": [], "errors": []}
+
+    normalize_source_name(source)
+    ordered_symbols = normalize_symbol_request_list(raw_symbols)
+    if not ordered_symbols:
+        return {"signals": [], "errors": []}
+
+    def fetch_one(raw_symbol: str) -> Dict[str, Any]:
+        symbol = resolve_symbol(raw_symbol)
+        payload = build_strategy_signal_payload_cached(symbol, strategy_id, source)
+        payload["requested_symbol"] = raw_symbol.lower()
+        return payload
+
+    signals: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+    max_workers = min(6, len(ordered_symbols)) or 1
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(fetch_one, symbol): symbol for symbol in ordered_symbols}
+        for future in as_completed(future_map):
+            raw_symbol = future_map[future]
+            try:
+                signals.append(future.result())
+            except Exception as exc:  # noqa: BLE001
+                errors.append({"symbol": raw_symbol, "error": str(exc)})
+
+    order_index = {symbol.lower(): idx for idx, symbol in enumerate(ordered_symbols)}
+    signals.sort(key=lambda item: order_index.get(item.get("requested_symbol", ""), len(order_index)))
+    for item in signals:
+        item.pop("requested_symbol", None)
+    errors.sort(key=lambda item: order_index.get(item["symbol"].lower(), len(order_index)))
+    return {"signals": signals, "errors": errors}
+
+
+def build_dashboard_pulse_payload(
+    symbol: str,
+    timeframe: str,
+    adjust: str,
+    history_bars: int,
+    source: str,
+    strategy_name: str,
+    raw_watchlist_symbols: str,
+    include_chart: bool = False,
+    include_watchlist_signals: bool = False,
+) -> Dict[str, Any]:
+    requested_source = normalize_source_name(source)
+    strategy_id = normalize_strategy_name(strategy_name)
+    watchlist_symbols = normalize_symbol_request_list(raw_watchlist_symbols)
+
+    payload: Dict[str, Any] = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "adjust": adjust,
+        "strategy": strategy_id,
+        "source": requested_source,
+        "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "chart": None,
+        "quote": None,
+        "strategy_signal": None,
+        "watchlist_quotes": {"quotes": [], "errors": []},
+        "watchlist_signals": {"signals": [], "errors": []},
+        "includes": {
+            "chart": include_chart,
+            "watchlist_signals": include_watchlist_signals and strategy_id != "none",
+        },
+    }
+    errors: Dict[str, str] = {}
+
+    def fetch_chart() -> Dict[str, Any]:
+        return build_chart_payload_cached(symbol, timeframe, adjust, history_bars, requested_source)
+
+    def fetch_quote() -> Dict[str, Any]:
+        snapshot = fetch_snapshot_cached(symbol, requested_source, ttl=SNAPSHOT_CACHE_TTL)
+        return {
+            "symbol": symbol,
+            "source": build_source_info(requested_source, snapshot.source),
+            "market": serialize_snapshot(snapshot),
+        }
+
+    jobs: Dict[Any, str] = {}
+    max_workers = 2
+    if strategy_id != "none":
+        max_workers += 1
+    if watchlist_symbols:
+        max_workers += 1
+        if include_watchlist_signals and strategy_id != "none":
+            max_workers += 1
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        jobs[executor.submit(fetch_chart if include_chart else fetch_quote)] = "chart" if include_chart else "quote"
+        if strategy_id != "none":
+            jobs[executor.submit(build_strategy_signal_payload_cached, symbol, strategy_id, requested_source)] = "strategy_signal"
+        if watchlist_symbols:
+            jobs[executor.submit(build_watchlist_quotes_payload, ",".join(watchlist_symbols), requested_source)] = "watchlist_quotes"
+            if include_watchlist_signals and strategy_id != "none":
+                jobs[
+                    executor.submit(
+                        build_watchlist_strategy_signals_payload,
+                        ",".join(watchlist_symbols),
+                        strategy_id,
+                        requested_source,
+                    )
+                ] = "watchlist_signals"
+
+        for future in as_completed(jobs):
+            key = jobs[future]
+            try:
+                result = future.result()
+                if key == "chart":
+                    payload["chart"] = result
+                    payload["quote"] = {
+                        "symbol": result["symbol"],
+                        "source": result["source"],
+                        "market": result["market"],
+                    }
+                else:
+                    payload[key] = result
+            except Exception as exc:  # noqa: BLE001
+                errors[key] = str(exc)
+
+    if errors:
+        payload["errors"] = errors
+    return payload
+
+
+def build_dashboard_pulse_payload_cached(
+    symbol: str,
+    timeframe: str,
+    adjust: str,
+    history_bars: int,
+    source: str,
+    strategy_name: str,
+    raw_watchlist_symbols: str,
+    include_chart: bool = False,
+    include_watchlist_signals: bool = False,
+) -> Dict[str, Any]:
+    requested_source = normalize_source_name(source)
+    strategy_id = normalize_strategy_name(strategy_name)
+    watchlist_key = ",".join(normalize_symbol_request_list(raw_watchlist_symbols))
+    cache_key = build_response_cache_key(
+        "dashboard-pulse",
+        symbol,
+        timeframe,
+        adjust,
+        history_bars,
+        requested_source,
+        strategy_id,
+        watchlist_key,
+        int(bool(include_chart)),
+        int(bool(include_watchlist_signals)),
+    )
+    return get_or_set_response_cache(
+        cache_key,
+        DASHBOARD_PULSE_CACHE_TTL,
+        lambda: build_dashboard_pulse_payload(
+            symbol,
+            timeframe,
+            adjust,
+            history_bars,
+            requested_source,
+            strategy_id,
+            watchlist_key,
+            include_chart=include_chart,
+            include_watchlist_signals=include_watchlist_signals,
+        ),
+    )
 
 
 def calc_kdj(
@@ -608,12 +1017,13 @@ def build_strategy_signal_payload(
 
     requested_source = normalize_source_name(source)
     timeframe = strategy["timeframe"] or "5m"
-    name, bars, actual_source = client.fetch_bars_with_source(
+    name, bars, actual_source = fetch_bars_with_source_cached(
         symbol,
         timeframe,
         120,
         "none",
-        source=requested_source,
+        requested_source,
+        STRATEGY_SIGNAL_CACHE_TTL,
     )
     if len(bars) < 35:
         raise MarketDataError(f"{symbol} 的 {timeframe} 数据不足，无法计算策略")
@@ -1197,12 +1607,13 @@ def build_chart_payload(
     source: str,
 ) -> Dict[str, Any]:
     requested_source = normalize_source_name(source)
-    name, bars, actual_source = client.fetch_bars_with_source(
+    name, bars, actual_source = fetch_bars_with_source_cached(
         symbol,
         timeframe,
         history_bars,
         adjust,
-        source=requested_source,
+        requested_source,
+        CHART_CACHE_TTL,
     )
     timestamps = [bar.timestamp for bar in bars]
     closes = [bar.close for bar in bars]
@@ -1221,7 +1632,7 @@ def build_chart_payload(
     change_pct = (change / previous_close * 100.0) if previous_close else 0.0
 
     try:
-        snapshot = client.fetch_snapshot(symbol, source=actual_source)
+        snapshot = fetch_snapshot_cached(symbol, actual_source, ttl=SNAPSHOT_CACHE_TTL)
     except MarketDataError:
         snapshot = build_snapshot_from_bars(symbol, name, bars, actual_source)
 
@@ -1279,7 +1690,15 @@ def index() -> str:
 
 @app.get("/api/health")
 def health() -> Any:
-    return jsonify({"status": "ok"})
+    with RESPONSE_CACHE_LOCK:
+        cache_entries = len(RESPONSE_CACHE)
+    return jsonify(
+        {
+            "status": "ok",
+            "cache_entries": cache_entries,
+            "source_health": SOURCE_HEALTH_TRACKER.snapshot(),
+        }
+    )
 
 
 @app.get("/api/sources")
@@ -1321,6 +1740,7 @@ def api_custom_strategy() -> Any:
             strategies = load_custom_strategies()
             strategies[strategy["id"]] = strategy
             save_custom_strategies(strategies)
+        clear_response_cache("strategy")
         return jsonify(
             {
                 "strategy": strategy,
@@ -1351,6 +1771,7 @@ def api_delete_custom_strategy(strategy_id: str) -> Any:
             else:
                 return jsonify({"error": "规则不存在"}), 404
             save_strategy_store(strategies, deleted)
+        clear_response_cache("strategy")
         return jsonify(
             {
                 "ok": True,
@@ -1459,7 +1880,7 @@ def api_chart() -> Any:
 
     try:
         symbol = resolve_symbol(raw_symbol)
-        payload = build_chart_payload(symbol, timeframe, adjust, bars, source)
+        payload = build_chart_payload_cached(symbol, timeframe, adjust, bars, source)
         return jsonify(payload)
     except MarketDataError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -1474,7 +1895,7 @@ def api_quote() -> Any:
     try:
         requested_source = normalize_source_name(source)
         symbol = resolve_symbol(raw_symbol)
-        snapshot = client.fetch_snapshot(symbol, source=requested_source)
+        snapshot = fetch_snapshot_cached(symbol, requested_source, ttl=SNAPSHOT_CACHE_TTL)
         return jsonify(
             {
                 "symbol": symbol,
@@ -1495,7 +1916,7 @@ def api_strategy_signal() -> Any:
     source = request.args.get("source", DEFAULT_SOURCE)
     try:
         symbol = resolve_symbol(raw_symbol)
-        return jsonify(build_strategy_signal_payload(symbol, strategy_name, source))
+        return jsonify(build_strategy_signal_payload_cached(symbol, strategy_name, source))
     except MarketDataError as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:  # noqa: BLE001
@@ -1507,63 +1928,7 @@ def api_watchlist_quotes() -> Any:
     raw_symbols = request.args.get("symbols", "")
     source = request.args.get("source", DEFAULT_SOURCE)
     try:
-        requested_source = normalize_source_name(source)
-
-        tokens = [item.strip() for item in raw_symbols.split(",") if item.strip()]
-        if not tokens:
-            return jsonify({"quotes": [], "errors": []})
-
-        ordered_symbols: List[str] = []
-        seen: set[str] = set()
-        for token in tokens[:120]:
-            normalized = token.lower()
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            ordered_symbols.append(token)
-
-        def fetch_one(raw_symbol: str) -> Dict[str, Any]:
-            symbol = resolve_symbol(raw_symbol)
-            snapshot = client.fetch_snapshot(symbol, source=requested_source)
-            streak = {"direction": "", "days": 0, "label": ""}
-            try:
-                _, bars, _ = client.fetch_bars_with_source(
-                    symbol,
-                    "1d",
-                    6,
-                    "none",
-                    source=requested_source,
-                )
-                streak = compute_consecutive_trend(bars)
-            except Exception:
-                streak = {"direction": "", "days": 0, "label": ""}
-            return {
-                "requested_symbol": raw_symbol.lower(),
-                "symbol": symbol,
-                "name": snapshot.name,
-                "source": build_source_info(requested_source, snapshot.source),
-                "market": serialize_snapshot(snapshot),
-                "streak": streak,
-            }
-
-        quotes: List[Dict[str, Any]] = []
-        errors: List[Dict[str, str]] = []
-        max_workers = min(6, len(ordered_symbols)) or 1
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {executor.submit(fetch_one, symbol): symbol for symbol in ordered_symbols}
-            for future in as_completed(future_map):
-                raw_symbol = future_map[future]
-                try:
-                    quotes.append(future.result())
-                except Exception as exc:  # noqa: BLE001
-                    errors.append({"symbol": raw_symbol, "error": str(exc)})
-
-        order_index = {symbol.lower(): idx for idx, symbol in enumerate(ordered_symbols)}
-        quotes.sort(key=lambda item: order_index.get(item.get("requested_symbol", ""), len(order_index)))
-        for item in quotes:
-            item.pop("requested_symbol", None)
-        errors.sort(key=lambda item: order_index.get(item["symbol"].lower(), len(order_index)))
-        return jsonify({"quotes": quotes, "errors": errors})
+        return jsonify(build_watchlist_quotes_payload(raw_symbols, source))
     except MarketDataError as exc:
         return jsonify({"error": str(exc), "quotes": [], "errors": []}), 400
     except Exception as exc:  # noqa: BLE001
@@ -1576,52 +1941,44 @@ def api_watchlist_strategy_signals() -> Any:
     strategy_name = request.args.get("strategy", DEFAULT_STRATEGY)
     source = request.args.get("source", DEFAULT_SOURCE)
     try:
-        strategy_id = normalize_strategy_name(strategy_name)
-        if strategy_id == "none":
-            return jsonify({"signals": [], "errors": []})
-
-        normalize_source_name(source)
-        tokens = [item.strip() for item in raw_symbols.split(",") if item.strip()]
-        if not tokens:
-            return jsonify({"signals": [], "errors": []})
-
-        ordered_symbols: List[str] = []
-        seen: set[str] = set()
-        for token in tokens[:120]:
-            normalized = token.lower()
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            ordered_symbols.append(token)
-
-        def fetch_one(raw_symbol: str) -> Dict[str, Any]:
-            symbol = resolve_symbol(raw_symbol)
-            payload = build_strategy_signal_payload(symbol, strategy_id, source)
-            payload["requested_symbol"] = raw_symbol.lower()
-            return payload
-
-        signals: List[Dict[str, Any]] = []
-        errors: List[Dict[str, str]] = []
-        max_workers = min(6, len(ordered_symbols)) or 1
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {executor.submit(fetch_one, symbol): symbol for symbol in ordered_symbols}
-            for future in as_completed(future_map):
-                raw_symbol = future_map[future]
-                try:
-                    signals.append(future.result())
-                except Exception as exc:  # noqa: BLE001
-                    errors.append({"symbol": raw_symbol, "error": str(exc)})
-
-        order_index = {symbol.lower(): idx for idx, symbol in enumerate(ordered_symbols)}
-        signals.sort(key=lambda item: order_index.get(item.get("requested_symbol", ""), len(order_index)))
-        for item in signals:
-            item.pop("requested_symbol", None)
-        errors.sort(key=lambda item: order_index.get(item["symbol"].lower(), len(order_index)))
-        return jsonify({"signals": signals, "errors": errors})
+        return jsonify(build_watchlist_strategy_signals_payload(raw_symbols, strategy_name, source))
     except MarketDataError as exc:
         return jsonify({"error": str(exc), "signals": [], "errors": []}), 400
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc), "signals": [], "errors": []}), 500
+
+
+@app.get("/api/dashboard-pulse")
+def api_dashboard_pulse() -> Any:
+    raw_symbol = request.args.get("symbol", DEFAULT_SYMBOL)
+    timeframe = request.args.get("timeframe", DEFAULT_TIMEFRAME)
+    adjust = request.args.get("adjust", DEFAULT_ADJUST)
+    source = request.args.get("source", DEFAULT_SOURCE)
+    strategy_name = request.args.get("strategy", DEFAULT_STRATEGY)
+    raw_watchlist_symbols = request.args.get("symbols", "")
+    include_chart = request.args.get("include_chart", "0") == "1"
+    include_watchlist_signals = request.args.get("include_watchlist_signals", "0") == "1"
+    bars = int(request.args.get("bars", "260"))
+    bars = max(80, min(bars, 1200))
+
+    try:
+        symbol = resolve_symbol(raw_symbol)
+        payload = build_dashboard_pulse_payload_cached(
+            symbol,
+            timeframe,
+            adjust,
+            bars,
+            source,
+            strategy_name,
+            raw_watchlist_symbols,
+            include_chart=include_chart,
+            include_watchlist_signals=include_watchlist_signals,
+        )
+        return jsonify(payload)
+    except MarketDataError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 500
 
 
 def webhook_provider_for_url(url: str) -> str:

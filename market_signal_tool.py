@@ -7,6 +7,7 @@ import math
 import sys
 import time
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -80,6 +81,11 @@ SOURCE_METADATA = {
     },
 }
 
+SOURCE_BASE_ORDER = {
+    "bars": ["tencent", "eastmoney"],
+    "snapshot": ["tencent", "eastmoney"],
+}
+
 
 @dataclass
 class Bar:
@@ -137,6 +143,121 @@ class MarketSnapshot:
 
 class MarketDataError(RuntimeError):
     pass
+
+
+@dataclass
+class SourceHealthRecord:
+    source: str
+    category: str
+    success_count: int = 0
+    failure_count: int = 0
+    consecutive_failures: int = 0
+    avg_latency_ms: float = 0.0
+    last_success_at: float = 0.0
+    last_failure_at: float = 0.0
+    cooldown_until: float = 0.0
+    last_error: str = ""
+
+    def score(self, now: float, priority_index: int) -> float:
+        score = 100.0 - (priority_index * 2.0)
+        if self.avg_latency_ms > 0:
+            score -= min(self.avg_latency_ms / 45.0, 24.0)
+        if self.consecutive_failures > 0:
+            score -= min(self.consecutive_failures * 18.0, 54.0)
+        if now < self.cooldown_until:
+            score -= 40.0
+        if self.last_success_at and self.last_success_at >= self.last_failure_at:
+            score += 4.0
+        return score
+
+
+class SourceHealthTracker:
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._stats: Dict[str, Dict[str, SourceHealthRecord]] = {
+            category: {
+                source: SourceHealthRecord(source=source, category=category)
+                for source in sources
+            }
+            for category, sources in SOURCE_BASE_ORDER.items()
+        }
+
+    def record_success(self, category: str, source: str, latency_ms: float) -> None:
+        with self._lock:
+            record = self._record_for(category, source)
+            record.success_count += 1
+            record.consecutive_failures = 0
+            record.last_success_at = time.time()
+            record.cooldown_until = 0.0
+            record.last_error = ""
+            if latency_ms > 0:
+                if record.avg_latency_ms <= 0:
+                    record.avg_latency_ms = latency_ms
+                else:
+                    record.avg_latency_ms = (record.avg_latency_ms * 0.72) + (latency_ms * 0.28)
+
+    def record_failure(self, category: str, source: str, latency_ms: float, error: str = "") -> None:
+        with self._lock:
+            record = self._record_for(category, source)
+            record.failure_count += 1
+            record.consecutive_failures += 1
+            record.last_failure_at = time.time()
+            record.last_error = str(error or "")
+            if latency_ms > 0 and record.avg_latency_ms <= 0:
+                record.avg_latency_ms = latency_ms
+            if record.consecutive_failures >= 2:
+                cooldown_seconds = min(18.0, 2.5 * (2 ** min(record.consecutive_failures - 2, 3)))
+                record.cooldown_until = record.last_failure_at + cooldown_seconds
+
+    def ordered_sources(self, category: str) -> List[str]:
+        default_sources = list(SOURCE_BASE_ORDER.get(category) or [])
+        if not default_sources:
+            return []
+        priority_lookup = {source: index for index, source in enumerate(default_sources)}
+        with self._lock:
+            now = time.time()
+            records = [
+                self._stats.get(category, {}).get(source) or SourceHealthRecord(source=source, category=category)
+                for source in default_sources
+            ]
+            records.sort(
+                key=lambda record: (
+                    -record.score(now, priority_lookup.get(record.source, len(default_sources))),
+                    priority_lookup.get(record.source, len(default_sources)),
+                    record.source,
+                )
+            )
+            return [record.source for record in records]
+
+    def snapshot(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        with self._lock:
+            now = time.time()
+            result: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            for category, items in self._stats.items():
+                priority_lookup = {source: index for index, source in enumerate(SOURCE_BASE_ORDER.get(category, []))}
+                result[category] = {}
+                for source, record in items.items():
+                    result[category][source] = {
+                        "score": round(record.score(now, priority_lookup.get(source, 0)), 2),
+                        "success_count": record.success_count,
+                        "failure_count": record.failure_count,
+                        "consecutive_failures": record.consecutive_failures,
+                        "avg_latency_ms": round(record.avg_latency_ms, 2),
+                        "last_success_at": record.last_success_at,
+                        "last_failure_at": record.last_failure_at,
+                        "cooldown_until": record.cooldown_until,
+                        "last_error": record.last_error,
+                    }
+            return result
+
+    def _record_for(self, category: str, source: str) -> SourceHealthRecord:
+        category_items = self._stats.setdefault(category, {})
+        if source not in category_items:
+            category_items[source] = SourceHealthRecord(source=source, category=category)
+        return category_items[source]
+
+
+SOURCE_HEALTH_TRACKER = SourceHealthTracker()
 
 
 def http_get_text(url: str, headers: Optional[Dict[str, str]] = None) -> str:
@@ -410,6 +531,7 @@ class EastMoneyClient:
         requested_source = normalize_source_name(source)
         errors: List[str] = []
         for source_name in self._bar_source_sequence(requested_source):
+            started_at = time.perf_counter()
             try:
                 if source_name == "eastmoney":
                     name, bars = self._fetch_bars_eastmoney(symbol, timeframe, max_bars, adjust)
@@ -417,8 +539,19 @@ class EastMoneyClient:
                     name, bars = self._fetch_bars_tencent(symbol, timeframe, max_bars, adjust)
                 else:
                     raise MarketDataError(f"unsupported bar source: {source_name}")
+                SOURCE_HEALTH_TRACKER.record_success(
+                    "bars",
+                    source_name,
+                    (time.perf_counter() - started_at) * 1000.0,
+                )
                 return name, bars, source_name
             except Exception as exc:  # noqa: BLE001
+                SOURCE_HEALTH_TRACKER.record_failure(
+                    "bars",
+                    source_name,
+                    (time.perf_counter() - started_at) * 1000.0,
+                    error=str(exc),
+                )
                 errors.append(f"{source_name}: {exc}")
                 if requested_source != "auto":
                     break
@@ -428,13 +561,27 @@ class EastMoneyClient:
         requested_source = normalize_source_name(source)
         errors: List[str] = []
         for source_name in self._snapshot_source_sequence(requested_source):
+            started_at = time.perf_counter()
             try:
                 if source_name == "eastmoney":
-                    return self._fetch_snapshot_eastmoney(symbol)
-                if source_name == "tencent":
-                    return self._fetch_snapshot_tencent(symbol)
-                raise MarketDataError(f"unsupported snapshot source: {source_name}")
+                    snapshot = self._fetch_snapshot_eastmoney(symbol)
+                elif source_name == "tencent":
+                    snapshot = self._fetch_snapshot_tencent(symbol)
+                else:
+                    raise MarketDataError(f"unsupported snapshot source: {source_name}")
+                SOURCE_HEALTH_TRACKER.record_success(
+                    "snapshot",
+                    source_name,
+                    (time.perf_counter() - started_at) * 1000.0,
+                )
+                return snapshot
             except Exception as exc:  # noqa: BLE001
+                SOURCE_HEALTH_TRACKER.record_failure(
+                    "snapshot",
+                    source_name,
+                    (time.perf_counter() - started_at) * 1000.0,
+                    error=str(exc),
+                )
                 errors.append(f"{source_name}: {exc}")
                 if requested_source != "auto":
                     break
@@ -443,13 +590,13 @@ class EastMoneyClient:
     @staticmethod
     def _bar_source_sequence(source: str) -> List[str]:
         if source == "auto":
-            return ["tencent", "eastmoney"]
+            return SOURCE_HEALTH_TRACKER.ordered_sources("bars")
         return [source]
 
     @staticmethod
     def _snapshot_source_sequence(source: str) -> List[str]:
         if source == "auto":
-            return ["tencent", "eastmoney"]
+            return SOURCE_HEALTH_TRACKER.ordered_sources("snapshot")
         return [source]
 
     def _fetch_bars_eastmoney(

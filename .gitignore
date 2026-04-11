@@ -13,3 +13,9 @@ venv/
 # OS artifacts
 Thumbs.db
 Desktop.ini
+
+# Packaging output
+build/
+dist/
+artifacts/
+.venv-package/

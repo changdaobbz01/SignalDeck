@@ -23,6 +23,10 @@ const T0_SYMBOL_OVERRIDES = new Set(["sz162719"]);
 const WATCHLIST_IMPORT_CODE_HEADERS = ["代码", "证券代码", "股票代码", "基金代码", "code", "symbol", "ticker"];
 const WATCHLIST_IMPORT_NAME_HEADERS = ["名称", "证券名称", "股票名称", "基金名称", "证券简称", "股票简称", "基金简称", "name"];
 
+const AUTO_REFRESH_INTERVAL_MS = 3000;
+const AUTO_REFRESH_CHART_INTERVAL_MS = 9000;
+const AUTO_REFRESH_WATCHLIST_SIGNAL_INTERVAL_MS = 6000;
+
 const state = {
   symbol: window.APP_DEFAULTS.symbol,
   timeframe: window.APP_DEFAULTS.timeframe,
@@ -55,17 +59,21 @@ const state = {
   rulesModalOpen: false,
   webhookModalOpen: false,
   signalDrawerOpen: false,
+  isRefreshingPulse: false,
   isLoadingChart: false,
   isLoadingQuote: false,
   isLoadingStrategy: false,
   isLoadingWatchlistQuotes: false,
   isLoadingWatchlistStrategySignals: false,
+  pulseRequestId: 0,
   marketRequestId: 0,
   quoteRequestId: 0,
   strategyRequestId: 0,
   watchlistQuoteRequestId: 0,
   watchlistStrategyRequestId: 0,
   lastStrategyAlertKey: "",
+  lastChartRefreshAt: 0,
+  lastWatchlistSignalRefreshAt: 0,
   watchlistStrategyTimer: null,
   watchlistScrollTimer: null,
 };
@@ -978,8 +986,7 @@ function mergeImportedWatchlistItems(items) {
   updateWatchlistButtonState();
 
   if (added.length > 0) {
-    fetchWatchlistQuotes({ silent: true });
-    fetchWatchlistStrategySignals({ silent: true });
+    runDashboardPulse({ silent: true, forceWatchlistSignals: true, announce: false });
   }
 
   return { added, skipped };
@@ -1284,6 +1291,38 @@ function watchlistAlertStateForRow(row) {
   return row.strategySignal?.triggered && ["BUY", "SELL"].includes(signal) ? signal : "HOLD";
 }
 
+function padDayKeyPart(value) {
+  return String(value).padStart(2, "0");
+}
+
+function currentWebhookDayKey() {
+  const now = new Date();
+  return `${now.getFullYear()}-${padDayKeyPart(now.getMonth() + 1)}-${padDayKeyPart(now.getDate())}`;
+}
+
+function webhookDayKeyFromValue(value) {
+  const digits = normalizeTimestampDigits(value);
+  if (digits.length >= 8) {
+    return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)}`;
+  }
+
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    return "";
+  }
+  return `${parsed.getFullYear()}-${padDayKeyPart(parsed.getMonth() + 1)}-${padDayKeyPart(parsed.getDate())}`;
+}
+
+function webhookDayKeyForRow(row) {
+  return (
+    webhookDayKeyFromValue(row.quote?.timestamp) ||
+    webhookDayKeyFromValue(row.strategySignal?.timestamp) ||
+    currentWebhookDayKey()
+  );
+}
+
 function setWebhookStatusMessage(message, tone = "neutral") {
   if (!dom.webhookStatusMessage) return;
   dom.webhookStatusMessage.textContent = message || "保存后会持久化到本地；测试发送使用当前输入地址。";
@@ -1513,8 +1552,12 @@ function seedWebhookAlertState(symbol) {
     quote: getWatchlistQuote(item),
     strategySignal: getWatchlistStrategySignal(item),
   };
+  const seededSignal = watchlistAlertStateForRow(row);
+  const dayKey = webhookDayKeyForRow(row);
   state.webhookAlertStates[normalized] = {
-    signal: watchlistAlertStateForRow(row),
+    signal: seededSignal,
+    dayKey,
+    lastAlertDayKey: ["BUY", "SELL"].includes(seededSignal) ? dayKey : "",
     updatedAt: Date.now(),
   };
   saveWebhookAlertStates();
@@ -1531,19 +1574,48 @@ function processWebhookAlerts() {
     const symbol = String(row.item?.symbol || "").trim().toLowerCase();
     if (!symbol) return;
     const nextSignal = watchlistAlertStateForRow(row);
-    const previous = state.webhookAlertStates[symbol]?.signal;
-    if (!previous) {
-      state.webhookAlertStates[symbol] = { signal: nextSignal, updatedAt: Date.now() };
+    const dayKey = webhookDayKeyForRow(row);
+    const previousEntry = state.webhookAlertStates[symbol] || {};
+    const previousSignal = previousEntry.signal;
+    const lastAlertDayKey = String(previousEntry.lastAlertDayKey || "");
+    const isAlertSignal = ["BUY", "SELL"].includes(nextSignal);
+    if (!previousSignal) {
+      state.webhookAlertStates[symbol] = {
+        signal: nextSignal,
+        dayKey,
+        lastAlertDayKey: isAlertSignal ? dayKey : "",
+        updatedAt: Date.now(),
+      };
       changed = true;
       return;
     }
-    if (previous === nextSignal) {
+    if (previousSignal === nextSignal) {
+      const isNewDay = String(previousEntry.dayKey || "") !== dayKey;
+      if (isNewDay) {
+        state.webhookAlertStates[symbol] = {
+          ...previousEntry,
+          signal: nextSignal,
+          dayKey,
+          updatedAt: Date.now(),
+        };
+        changed = true;
+        if (isAlertSignal && lastAlertDayKey !== dayKey && state.webhookAlertSymbols.has(symbol) && state.webhookUrl) {
+          state.webhookAlertStates[symbol].lastAlertDayKey = dayKey;
+          sendWebhookAlert(buildWebhookPayload(row, nextSignal));
+        }
+      }
       return;
     }
 
-    state.webhookAlertStates[symbol] = { signal: nextSignal, updatedAt: Date.now() };
+    state.webhookAlertStates[symbol] = {
+      ...previousEntry,
+      signal: nextSignal,
+      dayKey,
+      lastAlertDayKey: isAlertSignal ? dayKey : String(previousEntry.lastAlertDayKey || ""),
+      updatedAt: Date.now(),
+    };
     changed = true;
-    if (state.webhookAlertSymbols.has(symbol) && ["BUY", "SELL"].includes(nextSignal) && state.webhookUrl) {
+    if (state.webhookAlertSymbols.has(symbol) && isAlertSignal && state.webhookUrl) {
       sendWebhookAlert(buildWebhookPayload(row, nextSignal));
     }
   });
@@ -1591,8 +1663,7 @@ function renderSignalDrawerFromWatchlist() {
 async function refreshSignalDrawerData() {
   if (!state.signalDrawerOpen) return;
   renderSignalDrawerFromWatchlist();
-  await fetchWatchlistQuotes({ silent: true });
-  await fetchWatchlistStrategySignals({ silent: true });
+  await runDashboardPulse({ silent: true, forceWatchlistSignals: true, announce: false });
   renderSignalDrawerFromWatchlist();
 }
 
@@ -1683,8 +1754,7 @@ function setCurrentGroup(name) {
   state.watchlistModel.selectedGroup = name;
   saveWatchlistModel();
   renderWatchlist();
-  fetchWatchlistQuotes({ silent: true });
-  fetchWatchlistStrategySignals({ silent: true });
+  runDashboardPulse({ silent: true, forceWatchlistSignals: true, announce: false });
   updateWatchlistButtonState();
 }
 
@@ -1703,8 +1773,7 @@ function createGroup() {
   dom.groupNameInput.value = "";
   saveWatchlistModel();
   renderWatchlist();
-  fetchWatchlistQuotes({ silent: true });
-  fetchWatchlistStrategySignals({ silent: true });
+  runDashboardPulse({ silent: true, forceWatchlistSignals: true, announce: false });
   updateWatchlistButtonState();
 }
 
@@ -1724,8 +1793,7 @@ function deleteCurrentGroup() {
   }
   saveWatchlistModel();
   renderWatchlist();
-  fetchWatchlistQuotes({ silent: true });
-  fetchWatchlistStrategySignals({ silent: true });
+  runDashboardPulse({ silent: true, forceWatchlistSignals: true, announce: false });
   updateWatchlistButtonState();
 }
 
@@ -1835,8 +1903,7 @@ function renderWatchlist() {
       state.watchlistModel.groups[currentGroupName()] = currentGroupItems().filter((entry) => entry.symbol !== item.symbol);
       saveWatchlistModel();
       renderWatchlist();
-      fetchWatchlistQuotes({ silent: true });
-      fetchWatchlistStrategySignals({ silent: true });
+      runDashboardPulse({ silent: true, forceWatchlistSignals: true, announce: false });
       updateWatchlistButtonState();
     });
 
@@ -1948,8 +2015,7 @@ function renderWatchlist() {
       saveWebhookAlertSymbols();
       saveWebhookAlertStates();
       renderWatchlist();
-      fetchWatchlistQuotes({ silent: true });
-      fetchWatchlistStrategySignals({ silent: true });
+      runDashboardPulse({ silent: true, forceWatchlistSignals: true, announce: false });
       updateWatchlistButtonState();
     });
 
@@ -2501,26 +2567,31 @@ async function fetchStrategySignal(symbol = state.symbol, options = {}) {
   state.isLoadingStrategy = true;
 
   try {
-    const response = await fetch(
-      `/api/strategy-signal?symbol=${encodeURIComponent(symbol)}&strategy=${encodeURIComponent(state.strategy)}&source=${encodeURIComponent(state.source)}`
-    );
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.error || "Strategy load failed");
-    }
+    const payload = await requestDashboardPulse({
+      symbol,
+      timeframe: state.timeframe,
+      bars: 260,
+      source: state.source,
+      strategy: state.strategy,
+      watchlistSymbols: [],
+      includeChart: false,
+      includeWatchlistSignals: false,
+    });
 
     if (requestId !== state.strategyRequestId || symbol !== state.symbol) {
       return;
     }
 
-    if (normalizeStrategyValue(payload?.strategy?.id) !== normalizeStrategyValue(state.strategy)) {
+    if (normalizeStrategyValue(payload?.strategy_signal?.strategy?.id) !== normalizeStrategyValue(state.strategy)) {
       return;
     }
 
-    state.strategySignal = payload;
-    renderStrategySignal(payload);
-    maybeShowStrategyToast(payload, { announce });
-
+    applyDashboardPulsePayload(payload, {
+      includeChart: false,
+      includeWatchlistSignals: false,
+      announce,
+      now: Date.now(),
+    });
     if (!silent) {
       setRefreshStatus(`Strategy signal updated | ${new Date().toLocaleTimeString("zh-CN")}`);
     }
@@ -2654,8 +2725,7 @@ async function submitCustomStrategyRule() {
     }
     setCustomRuleMessage("规则已录入，并已切换到该策略。", "success");
     setRefreshStatus("自定义规则已录入");
-    fetchStrategySignal(state.symbol, { silent: true, announce: false });
-    fetchWatchlistStrategySignals({ silent: true });
+    runDashboardPulse({ silent: true, forceWatchlistSignals: true, announce: false });
   } catch (error) {
     console.error(error);
     setCustomRuleMessage(error.message || "规则录入失败", "error");
@@ -2709,7 +2779,7 @@ async function deleteSelectedCustomStrategy() {
     if (state.rulesModalOpen) {
       await refreshRulesModal({ force: true });
     }
-    fetchWatchlistStrategySignals({ silent: true });
+    runDashboardPulse({ silent: true, forceWatchlistSignals: true, announce: false });
     setRefreshStatus(`已删除自定义规则：${label}`);
   } catch (error) {
     console.error(error);
@@ -2794,6 +2864,189 @@ function applyWatchlistStrategySignals(payload) {
   }
 }
 
+function applyCurrentStrategySignalPayload(payload, options = {}) {
+  const { announce = false, silent = true } = options;
+  if (!payload) {
+    if (normalizeStrategyValue(state.strategy) === "none") {
+      state.strategySignal = null;
+      renderStrategySignal(null);
+    }
+    return;
+  }
+  if (payload.symbol && payload.symbol !== state.symbol) {
+    return;
+  }
+  if (normalizeStrategyValue(payload?.strategy?.id) !== normalizeStrategyValue(state.strategy)) {
+    return;
+  }
+  state.strategySignal = payload;
+  renderStrategySignal(payload);
+  maybeShowStrategyToast(payload, { announce });
+  if (!silent) {
+    setRefreshStatus(`Strategy signal updated | ${new Date().toLocaleTimeString("zh-CN")}`);
+  }
+}
+
+function applyChartPayload(payload) {
+  if (!payload) {
+    return;
+  }
+  state.currentPayload = payload;
+  state.symbol = payload.symbol;
+  dom.searchInput.value = payload.symbol;
+  renderSummary(payload);
+  renderMarketStats(payload.market);
+  renderChart(payload);
+  syncWatchlistName(payload.symbol, payload.name);
+  cacheWatchlistQuote(payload.symbol, payload.name, payload.market, payload.source?.actual);
+  renderWatchlist();
+  if (state.rulesPayload) {
+    renderRulesModal(state.rulesPayload);
+  }
+}
+
+function shouldRefreshChart(now, force = false) {
+  if (force) {
+    return true;
+  }
+  return !state.lastChartRefreshAt || now - state.lastChartRefreshAt >= AUTO_REFRESH_CHART_INTERVAL_MS;
+}
+
+function shouldRefreshWatchlistSignals(now, force = false) {
+  if (normalizeStrategyValue(state.strategy) === "none") {
+    return false;
+  }
+  if (force) {
+    return true;
+  }
+  return (
+    !state.lastWatchlistSignalRefreshAt ||
+    now - state.lastWatchlistSignalRefreshAt >= AUTO_REFRESH_WATCHLIST_SIGNAL_INTERVAL_MS
+  );
+}
+
+function buildDashboardPulseParams(options = {}) {
+  const {
+    symbol = state.symbol,
+    timeframe = state.timeframe,
+    bars = 260,
+    source = state.source,
+    strategy = state.strategy,
+    watchlistSymbols = currentGroupSymbols(),
+    includeChart = false,
+    includeWatchlistSignals = false,
+  } = options;
+  const params = new URLSearchParams({
+    symbol,
+    timeframe,
+    bars: String(bars),
+    source,
+    strategy,
+  });
+  if (watchlistSymbols.length > 0) {
+    params.set("symbols", watchlistSymbols.join(","));
+  }
+  if (includeChart) {
+    params.set("include_chart", "1");
+  }
+  if (includeWatchlistSignals) {
+    params.set("include_watchlist_signals", "1");
+  }
+  return params;
+}
+
+async function requestDashboardPulse(options = {}) {
+  const response = await fetch(`/api/dashboard-pulse?${buildDashboardPulseParams(options).toString()}`);
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.error || "Refresh failed");
+  }
+  return payload;
+}
+
+function applyDashboardPulsePayload(payload, options = {}) {
+  const { includeChart = false, includeWatchlistSignals = false, announce = true, now = Date.now() } = options;
+
+  if (includeChart && payload.chart) {
+    applyChartPayload(payload.chart);
+    state.lastChartRefreshAt = now;
+  } else if (payload.quote) {
+    applyQuotePayload(payload.quote);
+  }
+
+  if (payload.strategy_signal) {
+    applyCurrentStrategySignalPayload(payload.strategy_signal, { announce, silent: true });
+  } else if (normalizeStrategyValue(state.strategy) === "none") {
+    state.strategySignal = null;
+    renderStrategySignal(null);
+  }
+
+  if (payload.watchlist_quotes) {
+    applyWatchlistQuotes(payload.watchlist_quotes);
+  }
+
+  if (includeWatchlistSignals) {
+    if (payload.watchlist_signals) {
+      applyWatchlistStrategySignals(payload.watchlist_signals);
+    } else {
+      state.watchlistStrategySignals = {};
+      renderWatchlist();
+      processWebhookAlerts();
+    }
+    state.lastWatchlistSignalRefreshAt = now;
+  }
+
+  if (state.rulesPayload) {
+    renderRulesModal(state.rulesPayload);
+  }
+}
+
+async function runDashboardPulse(options = {}) {
+  const { silent = true, forceChart = false, forceWatchlistSignals = false, announce = true } = options;
+  if (!state.symbol || state.isRefreshingPulse || state.isLoadingChart) {
+    return;
+  }
+
+  const requestId = ++state.pulseRequestId;
+  const now = Date.now();
+  const includeChart = shouldRefreshChart(now, forceChart);
+  const includeWatchlistSignals = shouldRefreshWatchlistSignals(now, forceWatchlistSignals);
+  const targetSymbol = state.symbol;
+  const watchlistSymbols = currentGroupSymbols();
+
+  state.isRefreshingPulse = true;
+  try {
+    const payload = await requestDashboardPulse({
+      symbol: targetSymbol,
+      timeframe: state.timeframe,
+      bars: 260,
+      source: state.source,
+      strategy: state.strategy,
+      watchlistSymbols,
+      includeChart,
+      includeWatchlistSignals,
+    });
+    if (requestId !== state.pulseRequestId || targetSymbol !== state.symbol || payload.symbol !== state.symbol) {
+      return;
+    }
+
+    applyDashboardPulsePayload(payload, { includeChart, includeWatchlistSignals, announce, now });
+
+    if (!silent) {
+      setRefreshStatus(`自动刷新中 · ${new Date().toLocaleTimeString("zh-CN")}`);
+    }
+  } catch (error) {
+    console.error(error);
+    if (!silent) {
+      setRefreshStatus(error.message || "Refresh failed");
+    }
+  } finally {
+    if (requestId === state.pulseRequestId) {
+      state.isRefreshingPulse = false;
+    }
+  }
+}
+
 async function fetchWatchlistQuotes(options = {}) {
   const { silent = true } = options;
   const symbols = currentGroupSymbols();
@@ -2808,25 +3061,33 @@ async function fetchWatchlistQuotes(options = {}) {
   state.isLoadingWatchlistQuotes = true;
 
   try {
-    const response = await fetch(
-      `/api/watchlist-quotes?symbols=${encodeURIComponent(symbols.join(","))}&source=${encodeURIComponent(state.source)}`
-    );
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.error || "Watchlist quote load failed");
-    }
+    const payload = await requestDashboardPulse({
+      symbol: state.symbol || symbols[0],
+      timeframe: state.timeframe,
+      bars: 260,
+      source: state.source,
+      strategy: state.strategy,
+      watchlistSymbols: symbols,
+      includeChart: false,
+      includeWatchlistSignals: false,
+    });
     if (requestId !== state.watchlistQuoteRequestId) {
       return;
     }
 
-    applyWatchlistQuotes(payload);
-    if (!silent && Array.isArray(payload.errors) && payload.errors.length > 0) {
-      setRefreshStatus(payload.errors[0].error || "部分自选行情加载失败");
+    applyDashboardPulsePayload(payload, {
+      includeChart: false,
+      includeWatchlistSignals: false,
+      announce: false,
+      now: Date.now(),
+    });
+    if (!silent && Array.isArray(payload.watchlist_quotes?.errors) && payload.watchlist_quotes.errors.length > 0) {
+      setRefreshStatus(payload.watchlist_quotes.errors[0].error || "Watchlist quote load failed");
     }
   } catch (error) {
     console.error(error);
     if (!silent) {
-      setRefreshStatus(error.message || "自选行情加载失败");
+      setRefreshStatus(error.message || "Watchlist quote load failed");
     }
   } finally {
     if (requestId === state.watchlistQuoteRequestId) {
@@ -2864,33 +3125,28 @@ async function fetchWatchlistStrategySignals(options = {}) {
   state.isLoadingWatchlistStrategySignals = true;
 
   try {
-    const response = await fetch(
-      `/api/watchlist-strategy-signals?symbols=${encodeURIComponent(symbols.join(","))}&strategy=${encodeURIComponent(state.strategy)}&source=${encodeURIComponent(state.source)}`
-    );
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.error || "Watchlist strategy load failed");
-    }
+    const payload = await requestDashboardPulse({
+      symbol: state.symbol || symbols[0],
+      timeframe: state.timeframe,
+      bars: 260,
+      source: state.source,
+      strategy: state.strategy,
+      watchlistSymbols: symbols,
+      includeChart: false,
+      includeWatchlistSignals: true,
+    });
     if (requestId !== state.watchlistStrategyRequestId) {
       return;
     }
 
-    const nextSignals = {};
-    (payload?.signals || []).forEach((item) => {
-      const entry = normalizeWatchlistStrategySignal(item);
-      if (entry) {
-        nextSignals[entry.symbol] = entry;
-      }
+    applyDashboardPulsePayload(payload, {
+      includeChart: false,
+      includeWatchlistSignals: true,
+      announce: false,
+      now: Date.now(),
     });
-    state.watchlistStrategySignals = nextSignals;
-    renderWatchlist();
-    processWebhookAlerts();
-    if (state.signalDrawerOpen) {
-      renderSignalDrawerFromWatchlist();
-    }
-
-    if (!silent && Array.isArray(payload.errors) && payload.errors.length > 0) {
-      setRefreshStatus(payload.errors[0].error || "Watchlist strategy load failed");
+    if (!silent && Array.isArray(payload.watchlist_signals?.errors) && payload.watchlist_signals.errors.length > 0) {
+      setRefreshStatus(payload.watchlist_signals.errors[0].error || "Watchlist strategy load failed");
     }
   } catch (error) {
     console.error(error);
@@ -2917,25 +3173,33 @@ async function fetchQuote(symbol = state.symbol, options = {}) {
   state.isLoadingQuote = true;
 
   try {
-    const response = await fetch(
-      `/api/quote?symbol=${encodeURIComponent(symbol)}&source=${encodeURIComponent(state.source)}`
-    );
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.error || "Quote load failed");
-    }
+    const payload = await requestDashboardPulse({
+      symbol,
+      timeframe: state.timeframe,
+      bars: 260,
+      source: state.source,
+      strategy: state.strategy,
+      watchlistSymbols: [],
+      includeChart: false,
+      includeWatchlistSignals: false,
+    });
     if (requestId !== state.quoteRequestId || symbol !== state.symbol) {
       return;
     }
 
-    applyQuotePayload(payload);
+    applyDashboardPulsePayload(payload, {
+      includeChart: false,
+      includeWatchlistSignals: false,
+      announce: false,
+      now: Date.now(),
+    });
     if (!silent) {
       setRefreshStatus(`快照更新 · ${new Date().toLocaleTimeString("zh-CN")}`);
     }
   } catch (error) {
     console.error(error);
     if (!silent) {
-      setRefreshStatus(error.message || "快照加载失败");
+      setRefreshStatus(error.message || "Quote load failed");
     }
   } finally {
     if (requestId === state.quoteRequestId) {
@@ -2959,32 +3223,26 @@ async function loadMarket(symbol, options = {}) {
     setRefreshStatus(`正在加载 ${symbol} · ${getSourceMeta(state.source)?.label || state.source}`);
   }
   try {
-    const response = await fetch(
-      `/api/chart?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(state.timeframe)}&bars=260&source=${encodeURIComponent(state.source)}`
-    );
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.error || "Load failed");
-    }
+    const payload = await requestDashboardPulse({
+      symbol,
+      timeframe: state.timeframe,
+      bars: 260,
+      source: state.source,
+      strategy: state.strategy,
+      watchlistSymbols: currentGroupSymbols(),
+      includeChart: true,
+      includeWatchlistSignals: true,
+    });
     if (requestId !== state.marketRequestId) {
       return;
     }
 
-    state.currentPayload = payload;
-    state.symbol = payload.symbol;
-    dom.searchInput.value = payload.symbol;
-    renderSummary(payload);
-    renderMarketStats(payload.market);
-    renderChart(payload);
-    syncWatchlistName(payload.symbol, payload.name);
-    cacheWatchlistQuote(payload.symbol, payload.name, payload.market, payload.source?.actual);
-    renderWatchlist();
-    fetchStrategySignal(payload.symbol, { silent: true, announce: !background });
-    fetchWatchlistQuotes({ silent: true });
-    fetchWatchlistStrategySignals({ silent: true });
-    if (state.rulesPayload) {
-      renderRulesModal(state.rulesPayload);
-    }
+    applyDashboardPulsePayload(payload, {
+      includeChart: true,
+      includeWatchlistSignals: true,
+      announce: !background,
+      now: Date.now(),
+    });
     state.isLoadingChart = false;
     setRefreshStatus(`自动刷新中 · ${new Date().toLocaleTimeString("zh-CN")}`);
   } catch (error) {
@@ -3018,12 +3276,12 @@ function toggleCurrentIntoWatchlist() {
   saveWatchlistModel();
   cacheWatchlistQuote(symbol, state.currentPayload.name, state.currentPayload.market, state.currentPayload.source?.actual);
   renderWatchlist();
-  fetchWatchlistQuotes({ silent: true });
-  fetchWatchlistStrategySignals({ silent: true });
+  runDashboardPulse({ silent: true, forceWatchlistSignals: true, announce: false });
   updateWatchlistButtonState();
 }
 
-function startAutoRefresh() {
+function startAutoRefresh(options = {}) {
+  const { immediate = true } = options;
   if (state.refreshTimer) {
     clearInterval(state.refreshTimer);
   }
@@ -3039,24 +3297,17 @@ function startAutoRefresh() {
   if (state.watchlistStrategyTimer) {
     clearInterval(state.watchlistStrategyTimer);
   }
+  state.quoteTimer = null;
+  state.strategyTimer = null;
+  state.watchlistQuoteTimer = null;
+  state.watchlistStrategyTimer = null;
   state.refreshTimer = window.setInterval(() => {
     if (!state.symbol) return;
-    loadMarket(state.symbol, { silent: true, background: true });
-  }, 10000);
-  state.quoteTimer = window.setInterval(() => {
-    if (!state.symbol) return;
-    fetchQuote(state.symbol, { silent: true });
-  }, 3000);
-  state.strategyTimer = window.setInterval(() => {
-    if (!state.symbol || normalizeStrategyValue(state.strategy) === "none") return;
-    fetchStrategySignal(state.symbol, { silent: true, announce: true });
-  }, 5000);
-  state.watchlistQuoteTimer = window.setInterval(() => {
-    fetchWatchlistQuotes({ silent: true });
-  }, 5000);
-  state.watchlistStrategyTimer = window.setInterval(() => {
-    fetchWatchlistStrategySignals({ silent: true });
-  }, 8000);
+    runDashboardPulse({ silent: true, announce: true });
+  }, AUTO_REFRESH_INTERVAL_MS);
+  if (immediate) {
+    runDashboardPulse({ silent: true, forceWatchlistSignals: true, announce: false });
+  }
 }
 
 function bindEvents() {
@@ -3199,8 +3450,6 @@ function bindEvents() {
       refreshRulesModal({ force: true });
     }
     startAutoRefresh();
-    fetchStrategySignal(state.symbol, { silent: false, announce: true });
-    fetchWatchlistStrategySignals({ silent: true });
   });
 
   if (dom.strategyDeleteButton) {
@@ -3581,8 +3830,7 @@ function scheduleWatchlistScrollRefresh() {
   if (!dom.watchlist) return;
   clearTimeout(state.watchlistScrollTimer);
   state.watchlistScrollTimer = window.setTimeout(() => {
-    fetchWatchlistQuotes({ silent: true });
-    fetchWatchlistStrategySignals({ silent: true });
+    runDashboardPulse({ silent: true, forceWatchlistSignals: false, announce: false });
   }, 420);
 }
 
@@ -3732,8 +3980,6 @@ function bindEvents() {
       refreshRulesModal({ force: true });
     }
     startAutoRefresh();
-    fetchStrategySignal(state.symbol, { silent: false, announce: true });
-    fetchWatchlistStrategySignals({ silent: true });
   });
 
   if (dom.strategyDeleteButton) {
@@ -3948,8 +4194,6 @@ function bindEvents() {
       refreshRulesModal({ force: true });
     }
     startAutoRefresh();
-    fetchStrategySignal(state.symbol, { silent: false, announce: true });
-    fetchWatchlistStrategySignals({ silent: true });
   });
 
   if (dom.strategyDeleteButton) {
@@ -4028,10 +4272,8 @@ async function init() {
   await loadSources();
   await loadStrategies();
   await loadMarket(state.symbol);
-  await fetchWatchlistQuotes({ silent: true });
-  await fetchWatchlistStrategySignals({ silent: true });
   scheduleChartResize();
-  startAutoRefresh();
+  startAutoRefresh({ immediate: false });
 }
 
 init();
