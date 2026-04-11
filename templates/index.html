@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Signal Deck</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v='20260411h') }}">
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-block">
+          <p class="eyebrow">Realtime Workspace</p>
+          <div class="brand-row">
+            <h1>Signal Deck</h1>
+            <span class="brand-note">K / VOL / MACD / KDJ</span>
+            <button id="signalDrawerToggle" class="signal-side-tab brand-signal-tab" type="button" aria-expanded="false" aria-controls="signalDrawer">
+              规则命中
+            </button>
+            <button id="rulesButton" class="ghost-button brand-rules-button" type="button">规则说明</button>
+            <button id="webhookButton" class="ghost-button brand-webhook-button" type="button">WebHook</button>
+          </div>
+        </div>
+        <div class="topbar-status">
+          <div class="status-pill">
+            <span class="dot"></span>
+            <span id="refreshStatus">准备中</span>
+          </div>
+          <div class="status-pill compact">
+            <span class="status-label">实际源</span>
+            <strong id="activeSourceLabel">--</strong>
+          </div>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="main-stage">
+          <section class="control-panel">
+            <div class="search-card compact-card">
+              <div class="inline-label">证券代码 / 名称</div>
+              <div class="search-row">
+                <input id="searchInput" type="text" autocomplete="off" placeholder="例如 sh600519、600519、贵州茅台">
+                <button id="searchButton" class="primary-button" type="button">查询</button>
+                <button id="watchlistButton" class="secondary-button" type="button">加入当前组</button>
+              </div>
+              <div id="searchSuggestions" class="suggestions hidden"></div>
+            </div>
+
+            <div class="filters-card compact-card">
+              <div class="filters-inline">
+                <div class="compact-field source-field">
+                  <span class="inline-label">信息源</span>
+                  <select id="sourceSelect" class="accent-select"></select>
+                </div>
+                <div class="compact-field strategy-field">
+                  <span class="inline-label">Strategy</span>
+                  <div class="strategy-control-row">
+                    <button id="strategyDeleteButton" class="strategy-delete-button" type="button" disabled>删</button>
+                    <select id="strategySelect" class="accent-select"></select>
+                  </div>
+                </div>
+                <div class="compact-field timeframe-field">
+                  <span class="inline-label">周期</span>
+                  <div id="timeframeButtons" class="timeframe-buttons">
+                    <button data-timeframe="1m" type="button">1m</button>
+                    <button data-timeframe="5m" type="button">5m</button>
+                    <button data-timeframe="15m" type="button">15m</button>
+                    <button data-timeframe="30m" type="button">30m</button>
+                    <button data-timeframe="60m" type="button">60m</button>
+                    <button data-timeframe="1d" class="active" type="button">1d</button>
+                    <button data-timeframe="1w" type="button">1w</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="summary-grid">
+            <article class="metric-card metric-wide">
+              <span class="metric-label">标的</span>
+              <strong id="metricName" class="metric-value">--</strong>
+              <span id="metricSymbol" class="metric-subvalue">--</span>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">最新价</span>
+              <strong id="metricPrice" class="metric-value">--</strong>
+              <span id="metricChange" class="metric-subvalue">--</span>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">信号</span>
+              <strong id="metricSignal" class="metric-value signal-pill neutral">--</strong>
+              <span id="metricTime" class="metric-subvalue">--</span>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">信息源</span>
+              <strong id="metricSource" class="metric-value">--</strong>
+              <span id="metricSourceMeta" class="metric-subvalue">--</span>
+            </article>
+          </section>
+
+          <section class="market-grid">
+            <article class="stat-card">
+              <span class="stat-label">开盘</span>
+              <strong id="marketOpen" class="stat-value">--</strong>
+            </article>
+            <article class="stat-card">
+              <span class="stat-label">昨收</span>
+              <strong id="marketPrevClose" class="stat-value">--</strong>
+            </article>
+            <article class="stat-card">
+              <span class="stat-label">最高</span>
+              <strong id="marketHigh" class="stat-value">--</strong>
+            </article>
+            <article class="stat-card">
+              <span class="stat-label">最低</span>
+              <strong id="marketLow" class="stat-value">--</strong>
+            </article>
+            <article class="stat-card">
+              <span class="stat-label">成交量</span>
+              <strong id="marketVolume" class="stat-value">--</strong>
+            </article>
+            <article class="stat-card">
+              <span class="stat-label">成交额</span>
+              <strong id="marketAmount" class="stat-value">--</strong>
+            </article>
+            <article class="stat-card">
+              <span class="stat-label">换手率</span>
+              <strong id="marketTurnover" class="stat-value">--</strong>
+            </article>
+            <article class="stat-card">
+              <span class="stat-label">振幅</span>
+              <strong id="marketAmplitude" class="stat-value">--</strong>
+            </article>
+          </section>
+
+          <section class="chart-panel">
+            <div class="chart-legend-overlay" aria-hidden="true">
+              <div class="chart-legend-group legend-pane-price">
+                <span class="chart-legend-item legend-candle"><span class="legend-swatch legend-swatch-block"></span>K线</span>
+                <span class="chart-legend-item legend-ma5"><span class="legend-swatch"></span>MA5</span>
+                <span class="chart-legend-item legend-ma20"><span class="legend-swatch"></span>MA20</span>
+              </div>
+              <div class="indicator-header legend-pane-macd">
+                <span class="indicator-pill">MACD</span>
+                <span class="indicator-meta">(12,26,9)</span>
+                <span id="macdDifLabel" class="indicator-value indicator-dif">DIF:--</span>
+                <span id="macdDeaLabel" class="indicator-value indicator-dea">DEA:--</span>
+                <span id="macdHistLabel" class="indicator-value indicator-macd">MACD:--</span>
+              </div>
+              <div class="indicator-header legend-pane-kdj">
+                <span class="indicator-pill">KDJ</span>
+                <span class="indicator-meta">(9,3,3)</span>
+                <span id="kdjKLabel" class="indicator-value indicator-k">K:--</span>
+                <span id="kdjDLabel" class="indicator-value indicator-d">D:--</span>
+                <span id="kdjJLabel" class="indicator-value indicator-j">J:--</span>
+              </div>
+            </div>
+            <div id="chart" class="chart"></div>
+          </section>
+        </section>
+
+        <aside class="sidebar">
+          <section class="sidebar-card watchlist-card">
+            <div class="section-header watchlist-header">
+              <p class="eyebrow watchlist-title">Watchlist</p>
+              <button id="watchlistImportButton" class="group-action import-action" type="button">导入 XLSX</button>
+              <span id="watchlistCount" class="section-badge">0</span>
+            </div>
+            <input id="watchlistImportInput" class="hidden-file-input" type="file" accept=".xlsx,.xls">
+
+
+            <div class="group-toolbar watchlist-toolbar">
+              <div class="watchlist-sort-row">
+                <span class="field-label">排序</span>
+                <select id="watchlistSortSelect" class="accent-select">
+                  <option value="manual">手动排序</option>
+                  <option value="change_desc">涨幅排序</option>
+                  <option value="trend_up">趋势向上</option>
+                </select>
+              </div>
+              <div class="watchlist-search-row">
+                <span class="field-label">搜索</span>
+                <input id="watchlistSearchInput" type="text" autocomplete="off" placeholder="代码 / 名称">
+              </div>
+            </div>
+
+            <div id="watchlist" class="watchlist"></div>
+          </section>
+        </aside>
+      </main>
+
+      <div id="toastStack" class="toast-stack" aria-live="polite" aria-atomic="false"></div>
+      <div id="signalDrawerBackdrop" class="drawer-backdrop hidden"></div>
+      <aside id="signalDrawer" class="signal-drawer" aria-hidden="true">
+        <div class="drawer-header">
+          <div>
+            <p class="eyebrow">Signal Drawer</p>
+            <h2>规则命中</h2>
+          </div>
+          <button id="signalDrawerClose" class="drawer-close" type="button" aria-label="关闭规则抽屉">×</button>
+        </div>
+        <div class="signal-grid">
+          <div class="signal-box">
+            <span class="signal-box-label">买入命中</span>
+            <strong id="buyCount">0 / 0</strong>
+            <div id="buyReasons" class="reason-list"></div>
+          </div>
+          <div class="signal-box">
+            <span class="signal-box-label">卖出命中</span>
+            <strong id="sellCount">0 / 0</strong>
+            <div id="sellReasons" class="reason-list"></div>
+          </div>
+        </div>
+        <div id="warnings" class="warnings hidden"></div>
+      </aside>
+
+      <div id="rulesBackdrop" class="modal-backdrop hidden"></div>
+      <section id="rulesModal" class="rules-modal hidden" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="rulesModalTitle">
+        <div class="modal-header">
+          <div>
+            <p class="eyebrow">Rulebook</p>
+            <h2 id="rulesModalTitle">规则说明</h2>
+          </div>
+          <button id="rulesModalClose" class="modal-close" type="button" aria-label="关闭规则说明">×</button>
+        </div>
+
+        <div class="modal-meta">
+          <div class="meta-pill">
+            <span>默认周期</span>
+            <strong id="rulesTimeframe">--</strong>
+          </div>
+          <div class="meta-pill">
+            <span>默认复权</span>
+            <strong id="rulesAdjust">--</strong>
+          </div>
+          <div class="meta-pill">
+            <span>当前信息源</span>
+            <strong id="rulesCurrentSource">--</strong>
+          </div>
+        </div>
+
+        <section class="rules-current-status">
+          <span class="rules-current-label">当前策略</span>
+          <span id="strategySignalBadge" class="strategy-pill off">OFF</span>
+          <span id="strategySignalMeta" class="strategy-meta">Strategy alerts are off</span>
+        </section>
+
+        <section class="custom-rule-panel">
+          <div class="custom-rule-copy">
+            <h3>自定义规则</h3>
+            <p>格式：名称 | 周期 | BUY: 条件 | SELL: 条件。例：5m MACD/KDJ | Fixed 5m | BUY: DIF&gt;DEA AND K&gt;D | SELL: DIF&lt;DEA AND K&lt;D</p>
+          </div>
+          <div class="custom-rule-form">
+            <input id="customRuleInput" class="custom-rule-input" type="text" autocomplete="off" placeholder="名称 | 5m | BUY: DIF&gt;DEA AND K&gt;D | SELL: DIF&lt;DEA AND K&lt;D">
+            <button id="customRuleSaveButton" class="custom-rule-save" type="button">录入</button>
+          </div>
+          <p id="customRuleMessage" class="custom-rule-message"></p>
+        </section>
+
+        <div class="modal-body">
+          <section class="modal-section">
+            <h3>指标清单</h3>
+            <div id="indicatorList" class="modal-list"></div>
+          </section>
+          <section class="modal-section">
+            <h3>买入规则</h3>
+            <div id="buyRulesList" class="modal-list"></div>
+          </section>
+          <section class="modal-section">
+            <h3>卖出规则</h3>
+            <div id="sellRulesList" class="modal-list"></div>
+          </section>
+          <section class="modal-section">
+            <h3>说明</h3>
+            <div id="rulesNotes" class="modal-list"></div>
+          </section>
+        </div>
+      </section>
+
+      <div id="webhookBackdrop" class="modal-backdrop hidden"></div>
+      <section id="webhookModal" class="rules-modal webhook-modal hidden" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="webhookModalTitle">
+        <div class="modal-header">
+          <div>
+            <p class="eyebrow">Webhook Desk</p>
+            <h2 id="webhookModalTitle">WebHook 设置</h2>
+          </div>
+          <button id="webhookModalClose" class="modal-close" type="button" aria-label="关闭 WebHook 设置">×</button>
+        </div>
+
+        <div class="modal-meta webhook-meta-grid">
+          <div class="meta-pill">
+            <span>已保存地址</span>
+            <strong id="webhookSavedUrl">--</strong>
+          </div>
+          <div class="meta-pill">
+            <span>提醒标的数</span>
+            <strong id="webhookSelectedCount">0</strong>
+          </div>
+          <div class="meta-pill">
+            <span>最近状态</span>
+            <strong id="webhookLastResult">--</strong>
+          </div>
+        </div>
+
+        <section class="webhook-panel">
+          <div class="webhook-copy">
+            <h3>录入与测试</h3>
+            <p>保存后会持久化到本地。测试发送使用当前输入地址，不会覆盖已保存地址。实际提醒仅在 BUY / SELL 状态切换首次命中时发送。</p>
+          </div>
+          <div class="webhook-modal-row">
+            <input id="webhookInput" class="webhook-input" type="url" autocomplete="off" placeholder="https://example.com/webhook">
+            <button id="webhookSaveButton" class="webhook-save-button" type="button">保存</button>
+            <button id="webhookTestButton" class="ghost-button webhook-test-button" type="button">测试</button>
+          </div>
+          <p id="webhookStatusMessage" class="webhook-status-message">--</p>
+        </section>
+
+        <section class="modal-section webhook-log-section">
+          <div class="webhook-log-header">
+            <h3>发送记录</h3>
+            <span class="section-badge" id="webhookLogCount">0</span>
+          </div>
+          <div id="webhookLogList" class="webhook-log-list"></div>
+        </section>
+      </section>
+    </div>
+
+    <script>
+      window.APP_DEFAULTS = {
+        symbol: "{{ default_symbol }}",
+        timeframe: "{{ default_timeframe }}",
+        source: "{{ default_source }}",
+        strategy: "{{ default_strategy }}"
+      };
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+    <script src="{{ url_for('static', filename='app.js', v='20260411h') }}"></script>
+  </body>
+</html>

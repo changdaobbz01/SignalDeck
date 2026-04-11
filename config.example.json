@@ -1,0 +1,65 @@
+{
+  "timeframe": "1d",
+  "adjust": "qfq",
+  "history_bars": 250,
+  "symbols": [
+    "sh000001",
+    "sh000300",
+    "sh600519"
+  ],
+  "indicators": {
+    "ma5": {
+      "type": "sma",
+      "source": "close",
+      "window": 5
+    },
+    "ma20": {
+      "type": "sma",
+      "source": "close",
+      "window": 20
+    },
+    "ema12": {
+      "type": "ema",
+      "source": "close",
+      "window": 12
+    },
+    "ema26": {
+      "type": "ema",
+      "source": "close",
+      "window": 26
+    },
+    "rsi14": {
+      "type": "rsi",
+      "source": "close",
+      "window": 14
+    },
+    "macd": {
+      "type": "macd",
+      "source": "close",
+      "fast": 12,
+      "slow": 26,
+      "signal": 9
+    },
+    "boll": {
+      "type": "bollinger",
+      "source": "close",
+      "window": 20,
+      "stddev": 2
+    },
+    "atr14": {
+      "type": "atr",
+      "window": 14
+    }
+  },
+  "rules": {
+    "buy": [
+      "cross_over(\"ma5\", \"ma20\")",
+      "rsi14 is not None and rsi14 < 70",
+      "close > boll_mid"
+    ],
+    "sell": [
+      "cross_under(\"ma5\", \"ma20\")",
+      "rsi14 is not None and rsi14 > 80"
+    ]
+  }
+}

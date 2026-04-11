@@ -1,0 +1,46 @@
+{
+  "strategies": {
+    "custom_b419b6d5c4": {
+      "id": "custom_b419b6d5c4",
+      "label": "规则2 - 15m MACD/KDJ",
+      "description": "15m 自定义规则 · BUY: DIF<DEA AND K<D · SELL: DIF<DEA AND K<D",
+      "timeframe": "15m",
+      "type": "custom",
+      "buy_rule": "DIF<DEA AND K<D",
+      "sell_rule": "DIF<DEA AND K<D",
+      "indicators": [
+        {
+          "name": "DIF",
+          "type": "custom",
+          "description": "MACD DIF 快线"
+        },
+        {
+          "name": "DEA",
+          "type": "custom",
+          "description": "MACD DEA 慢线"
+        },
+        {
+          "name": "K",
+          "type": "custom",
+          "description": "KDJ K 值"
+        },
+        {
+          "name": "D",
+          "type": "custom",
+          "description": "KDJ D 值"
+        }
+      ],
+      "buy_rules": [
+        "15m DIF<DEA AND K<D"
+      ],
+      "sell_rules": [
+        "15m DIF<DEA AND K<D"
+      ],
+      "notes": [
+        "自定义规则使用当前所选信息源计算。",
+        "支持指标 DIF、DEA、K、D、J、OPEN、HIGH、LOW、CLOSE、VOLUME、AMOUNT。",
+        "条件支持 >、<、>=、<=、==、!=，可用 AND/OR 或 且/或 连接。"
+      ]
+    }
+  }
+}

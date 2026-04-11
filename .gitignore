@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.log
+runtime_probe.txt
+
+# Local environment and editor files
+.env
+.venv/
+venv/
+.idea/
+.vscode/
+
+# OS artifacts
+Thumbs.db
+Desktop.ini
